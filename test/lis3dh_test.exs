@@ -233,6 +233,7 @@ defmodule LIS3DHTest do
   describe "read_auxiliary_adc/2" do
     test "errors without a cached operating_mode" do
       {:ok, fake} = Fake.acquire([])
+
       assert {:error, :operating_mode_not_set} =
                LIS3DH.read_auxiliary_adc(%LIS3DH{conn: fake}, 1)
     end
@@ -300,6 +301,280 @@ defmodule LIS3DHTest do
       |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x80, 0xFD>>, fake} end)
 
       assert {:ok, -10.0} = LIS3DH.read_temperature(acc)
+    end
+  end
+
+  describe "configure_free_fall/3" do
+    test "writes the AND/all-axes-low pattern with default threshold + duration" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      I2C
+      # threshold: 350 mg / 16 mg-per-LSB = 21 → 0x15
+      |> expect(:write, fn ^fake, <<0xB2, 0x15>>, _opts -> {:ok, fake} end)
+      # duration: 5 → 0x05
+      |> expect(:write, fn ^fake, <<0xB3, 0x05>>, _opts -> {:ok, fake} end)
+      # INT1_CFG: AOI=1, 6D=0, ZL+YL+XL = 0b1001_0101 = 0x95
+      |> expect(:write, fn ^fake, <<0xB0, 0x95>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.configure_free_fall(acc, :int1)
+    end
+  end
+
+  describe "configure_motion/3" do
+    test "writes the OR/all-axes-high pattern" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      I2C
+      # threshold: 250 / 16 = 15 → 0x0F
+      |> expect(:write, fn ^fake, <<0xB6, 0x0F>>, _opts -> {:ok, fake} end)
+      |> expect(:write, fn ^fake, <<0xB7, 0x00>>, _opts -> {:ok, fake} end)
+      # INT2_CFG: AOI=0, 6D=0, ZH+YH+XH = 0b0010_1010 = 0x2A
+      |> expect(:write, fn ^fake, <<0xB4, 0x2A>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_motion(acc, :int2, threshold_mg: 250)
+    end
+  end
+
+  describe "configure_orientation/3" do
+    test "encodes 6D position with all axes and sets D4D_INT1 to 0 by default" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      I2C
+      # threshold: 320 / 16 = 20 → 0x14
+      |> expect(:write, fn ^fake, <<0xB2, 0x14>>, _opts -> {:ok, fake} end)
+      |> expect(:write, fn ^fake, <<0xB3, 0x00>>, _opts -> {:ok, fake} end)
+      # INT1_CFG: AOI=1, 6D=1, all 6 axes = 0xFF
+      |> expect(:write, fn ^fake, <<0xB0, 0xFF>>, _opts -> {:ok, fake} end)
+      # CTRL_REG5 read-modify-write: clear D4D_INT1 (bit 2)
+      |> expect(:write_read, fn ^fake, <<0xA4>>, 1, _opts -> {:ok, <<0x04>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA4, 0x00>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_orientation(acc, :int1, threshold_mg: 320)
+    end
+
+    test "4D detection sets D4D_INT2" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      I2C
+      |> expect(:write, fn ^fake, <<0xB6, 0x14>>, _opts -> {:ok, fake} end)
+      |> expect(:write, fn ^fake, <<0xB7, 0x00>>, _opts -> {:ok, fake} end)
+      # INT2_CFG: AOI=0, 6D=1, all 6 = 0b0111_1111 = 0x7F
+      |> expect(:write, fn ^fake, <<0xB4, 0x7F>>, _opts -> {:ok, fake} end)
+      # CTRL_REG5: set D4D_INT2 (bit 0)
+      |> expect(:write_read, fn ^fake, <<0xA4>>, 1, _opts -> {:ok, <<0x00>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA4, 0x01>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_orientation(acc, :int2,
+                 mode: :movement,
+                 detection: :four_d,
+                 threshold_mg: 320
+               )
+    end
+  end
+
+  describe "configure_click/2" do
+    test "writes CLICK_THS, TIME_LIMIT, TIME_LATENCY, TIME_WINDOW, then CLICK_CFG" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      I2C
+      # CLICK_THS at 0x3A: 1200 mg / 16 mg-per-LSB = 75 → 0x4B (LIR=0)
+      |> expect(:write, fn ^fake, <<0xBA, 0x4B>>, _opts -> {:ok, fake} end)
+      # TIME_LIMIT at 0x3B: 10
+      |> expect(:write, fn ^fake, <<0xBB, 0x0A>>, _opts -> {:ok, fake} end)
+      # TIME_LATENCY at 0x3C: 20
+      |> expect(:write, fn ^fake, <<0xBC, 0x14>>, _opts -> {:ok, fake} end)
+      # TIME_WINDOW at 0x3D: 100
+      |> expect(:write, fn ^fake, <<0xBD, 0x64>>, _opts -> {:ok, fake} end)
+      # CLICK_CFG at 0x38: single-click Z = 0x10
+      |> expect(:write, fn ^fake, <<0xB8, 0x10>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_click(acc,
+                 events: [:single_click_z],
+                 threshold_mg: 1200,
+                 time_limit: 10,
+                 time_latency: 20,
+                 time_window: 100
+               )
+    end
+
+    test "errors when range isn't cached" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, range: nil}
+
+      assert {:error, :range_not_set} =
+               LIS3DH.configure_click(acc,
+                 events: [],
+                 threshold_mg: 0,
+                 time_limit: 0,
+                 time_latency: 0
+               )
+    end
+  end
+
+  describe "read_click_source/1" do
+    test "decodes CLICK_SRC" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xB9>>, 1, _opts -> {:ok, <<0x64>>, fake} end)
+
+      assert {:ok, %{double_click: true, z: true}} = LIS3DH.read_click_source(acc)
+    end
+  end
+
+  describe "configure_activity/2" do
+    test "writes ACT_THS then ACT_DUR" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :low_power, range: 2}
+
+      I2C
+      # ACT_THS at 0x3E: 320 / 16 = 20 → 0x14
+      |> expect(:write, fn ^fake, <<0xBE, 0x14>>, _opts -> {:ok, fake} end)
+      # ACT_DUR at 0x3F: 0x0A
+      |> expect(:write, fn ^fake, <<0xBF, 0x0A>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_activity(acc, threshold_mg: 320, duration: 10)
+    end
+  end
+
+  describe "disable_activity/1" do
+    test "writes 0 to ACT_THS" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write, fn ^fake, <<0xBE, 0x00>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.disable_activity(acc)
+    end
+  end
+
+  describe "configure_inertial_interrupt/3" do
+    test "writes INT1_THS, INT1_DURATION, INT1_CFG in that order using the cached range" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      I2C
+      # INT1_THS = 160 mg / 16 mg-per-LSB = 10 → 0x0A at 0x32
+      |> expect(:write, fn ^fake, <<0xB2, 0x0A>>, _opts -> {:ok, fake} end)
+      # INT1_DURATION = 5 → 0x05 at 0x33
+      |> expect(:write, fn ^fake, <<0xB3, 0x05>>, _opts -> {:ok, fake} end)
+      # INT1_CFG = AOI(1)|6D(0)|XYZ-low → 0b1001_0101 = 0x95 at 0x30
+      |> expect(:write, fn ^fake, <<0xB0, 0x95>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_inertial_interrupt(acc, :int1,
+                 mode: :and,
+                 axes: [:x_low, :y_low, :z_low],
+                 threshold_mg: 160,
+                 duration: 5
+               )
+    end
+
+    test "errors when range isn't cached" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: nil}
+
+      assert {:error, :range_not_set} =
+               LIS3DH.configure_inertial_interrupt(acc, :int1, threshold_mg: 0)
+    end
+  end
+
+  describe "read_interrupt_source/2" do
+    test "reads INT2_SRC and decodes the flags" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xB5>>, 1, _opts -> {:ok, <<0x46>>, fake} end)
+
+      assert {:ok, %{active: true, z_high: false, y_low: true, x_high: true}} =
+               LIS3DH.read_interrupt_source(acc, :int2)
+    end
+  end
+
+  describe "interrupt routing" do
+    test "enable_int1_routing ORs in :ia1 + :click" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      # CTRL_REG3 at 0x22; mask for :ia1 + :click = 0xC0
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA2>>, 1, _opts -> {:ok, <<0x04>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA2, 0xC4>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.enable_int1_routing(acc, [:ia1, :click])
+    end
+
+    test "disable_int1_routing masks out specified bits, leaves others" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA2>>, 1, _opts -> {:ok, <<0xC4>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA2, 0x84>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.disable_int1_routing(acc, [:ia1])
+    end
+
+    test "enable_int2_routing ORs in :activity + :ia2" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      # CTRL_REG6 at 0x25; mask :activity (bit 3) + :ia2 (bit 5) = 0x28
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA5>>, 1, _opts -> {:ok, <<0x00>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA5, 0x28>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.enable_int2_routing(acc, [:activity, :ia2])
+    end
+  end
+
+  describe "set_interrupt_polarity/2" do
+    test "active_low sets bit 1 of CTRL_REG6" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA5>>, 1, _opts -> {:ok, <<0x28>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA5, 0x2A>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.set_interrupt_polarity(acc, :active_low)
+    end
+  end
+
+  describe "set_interrupt_latching/3 and set_4d_detection/3" do
+    test "latching INT1 sets bit 3 of CTRL_REG5" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA4>>, 1, _opts -> {:ok, <<0x00>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA4, 0x08>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.set_interrupt_latching(acc, :int1, true)
+    end
+
+    test "4D on INT2 sets bit 0 of CTRL_REG5" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA4>>, 1, _opts -> {:ok, <<0x00>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA4, 0x01>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.set_4d_detection(acc, :int2, true)
     end
   end
 

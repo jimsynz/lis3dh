@@ -29,7 +29,9 @@ defmodule LIS3DH do
 
   import Bitwise
 
+  alias LIS3DH.Click
   alias LIS3DH.Config
+  alias LIS3DH.Interrupts
   alias LIS3DH.Registers
   alias Wafer.Chip
   alias Wafer.Conn
@@ -118,7 +120,9 @@ defmodule LIS3DH do
   @spec reboot(t) :: {:ok, t} | {:error, term}
   def reboot(%__MODULE__{} = acc) do
     with {:ok, acc} <-
-           Registers.update_ctrl_reg_5(acc, fn <<byte>> -> <<byte ||| 1 <<< @ctrl_reg_5_boot_bit>> end) do
+           Registers.update_ctrl_reg_5(acc, fn <<byte>> ->
+             <<byte ||| 1 <<< @ctrl_reg_5_boot_bit>>
+           end) do
       Process.sleep(@boot_delay_ms)
       {:ok, acc}
     end
@@ -223,7 +227,9 @@ defmodule LIS3DH do
   @doc "Clear `TEMP_CFG_REG.ADC_EN`, disabling all three auxiliary ADC channels."
   @spec disable_auxiliary_adc(t) :: {:ok, t} | {:error, term}
   def disable_auxiliary_adc(%__MODULE__{} = acc) do
-    Registers.update_temp_cfg_reg(acc, fn <<byte>> -> <<byte &&& bnot(1 <<< @adc_en_bit) &&& 0xFF>> end)
+    Registers.update_temp_cfg_reg(acc, fn <<byte>> ->
+      <<byte &&& bnot(1 <<< @adc_en_bit) &&& 0xFF>>
+    end)
   end
 
   @doc """
@@ -241,7 +247,9 @@ defmodule LIS3DH do
   @doc "Clear `TEMP_CFG_REG.TEMP_EN` (leaving `ADC_EN` alone)."
   @spec disable_temperature_sensor(t) :: {:ok, t} | {:error, term}
   def disable_temperature_sensor(%__MODULE__{} = acc) do
-    Registers.update_temp_cfg_reg(acc, fn <<byte>> -> <<byte &&& bnot(1 <<< @temp_en_bit) &&& 0xFF>> end)
+    Registers.update_temp_cfg_reg(acc, fn <<byte>> ->
+      <<byte &&& bnot(1 <<< @temp_en_bit) &&& 0xFF>>
+    end)
   end
 
   @doc """
@@ -358,6 +366,374 @@ defmodule LIS3DH do
   end
 
   @doc """
+  Configure a free-fall detector on the given interrupt pin.
+
+  Free-fall is signalled when the magnitude of acceleration on all three
+  axes falls below a threshold for a configurable duration (i.e. the device
+  is in true free fall, ~0 g on every axis).
+
+  ## Options
+
+    * `:threshold_mg` — threshold in milli-g (default `350`, the AN3308
+      recommended value). Lower thresholds trigger more easily.
+    * `:duration` — `0..127` count of `1/ODR` periods (default `5`).
+  """
+  @spec configure_free_fall(t, Interrupts.pin(), keyword) :: {:ok, t} | {:error, term}
+  def configure_free_fall(%__MODULE__{} = acc, pin, opts \\ []) do
+    configure_inertial_interrupt(acc, pin,
+      mode: :and,
+      axes: [:x_low, :y_low, :z_low],
+      threshold_mg: Keyword.get(opts, :threshold_mg, 350),
+      duration: Keyword.get(opts, :duration, 5)
+    )
+  end
+
+  @doc """
+  Configure a motion (wake-up) detector on the given interrupt pin.
+
+  Motion is signalled when **any** enabled axis exceeds the threshold for
+  the configured duration.
+
+  ## Options
+
+    * `:threshold_mg` — threshold in milli-g (no default, must be specified).
+    * `:duration` — `0..127` count of `1/ODR` periods (default `0`).
+    * `:axes` — list of `t:LIS3DH.Interrupts.axis_event/0` (default
+      `[:x_high, :y_high, :z_high]`).
+  """
+  @spec configure_motion(t, Interrupts.pin(), keyword) :: {:ok, t} | {:error, term}
+  def configure_motion(%__MODULE__{} = acc, pin, opts) do
+    configure_inertial_interrupt(acc, pin,
+      mode: :or,
+      axes: Keyword.get(opts, :axes, [:x_high, :y_high, :z_high]),
+      threshold_mg: Keyword.fetch!(opts, :threshold_mg),
+      duration: Keyword.get(opts, :duration, 0)
+    )
+  end
+
+  @doc """
+  Configure 6D or 4D orientation detection on the given interrupt pin.
+
+  ## Options
+
+    * `:mode` — `:movement` (interrupt fires on transitions between known
+      zones) or `:position` (interrupt stays asserted while inside a known
+      zone). Default `:position`.
+    * `:detection` — `:six_d` (default, all six face-down/face-up directions)
+      or `:four_d` (X/Y plane only, Z ignored — for portrait/landscape).
+    * `:axes` — list of `t:LIS3DH.Interrupts.axis_event/0` to enable
+      (default all six).
+    * `:threshold_mg` — threshold in milli-g (no default; the zone half-width
+      is typically chosen so two zones don't overlap).
+    * `:duration` — `0..127` count of `1/ODR` periods (default `0`).
+
+  Writes the configured `INT*_CFG`, `INT*_THS`, `INT*_DURATION` and also
+  toggles `CTRL_REG5.D4D_INT*` to match the `:detection` choice.
+  """
+  @spec configure_orientation(t, Interrupts.pin(), keyword) :: {:ok, t} | {:error, term}
+  def configure_orientation(%__MODULE__{} = acc, pin, opts) do
+    aoi_mode =
+      case Keyword.get(opts, :mode, :position) do
+        :movement -> :six_d_movement
+        :position -> :six_d_position
+      end
+
+    detection = Keyword.get(opts, :detection, :six_d)
+
+    axes =
+      Keyword.get(opts, :axes, [:x_high, :x_low, :y_high, :y_low, :z_high, :z_low])
+
+    with {:ok, acc} <-
+           configure_inertial_interrupt(acc, pin,
+             mode: aoi_mode,
+             axes: axes,
+             threshold_mg: Keyword.fetch!(opts, :threshold_mg),
+             duration: Keyword.get(opts, :duration, 0)
+           ) do
+      set_4d_detection(acc, pin, detection == :four_d)
+    end
+  end
+
+  @doc """
+  Configure sleep-to-wake / return-to-sleep by writing `ACT_THS` and
+  `ACT_DUR`.
+
+  When acceleration falls below `:threshold_mg` for the configured
+  `:duration`, the device automatically switches to low-power mode at 10 Hz
+  ODR regardless of the original `CTRL_REG1` / `CTRL_REG4` settings. When
+  acceleration rises above the threshold, the device restores the original
+  configuration.
+
+  ## Options
+
+    * `:threshold_mg` — threshold in milli-g (required). Uses the same LSB
+      table as `INT*_THS`. Pass `0` to disable activity detection.
+    * `:duration` — `0..255` (required). One LSB corresponds to
+      `(8 × duration + 1) / ODR` seconds per datasheet §8.36.
+
+  Requires the accelerometer range to be cached on the struct.
+  """
+  @spec configure_activity(t, keyword) :: {:ok, t} | {:error, term}
+  def configure_activity(%__MODULE__{range: nil}, _opts), do: {:error, :range_not_set}
+
+  def configure_activity(%__MODULE__{range: range} = acc, opts) do
+    threshold_mg = Keyword.fetch!(opts, :threshold_mg)
+    duration = Keyword.fetch!(opts, :duration)
+
+    unless is_integer(duration) and duration in 0..255,
+      do: raise(ArgumentError, "invalid duration: #{inspect(duration)} (must be 0..255)")
+
+    ths = Interrupts.encode_threshold!(threshold_mg, range)
+
+    with {:ok, acc} <- Registers.write_act_ths(acc, ths) do
+      Registers.write_act_dur(acc, <<duration>>)
+    end
+  end
+
+  @doc "Disable activity detection by writing `0` to `ACT_THS`."
+  @spec disable_activity(t) :: {:ok, t} | {:error, term}
+  def disable_activity(%__MODULE__{} = acc) do
+    Registers.write_act_ths(acc, <<0>>)
+  end
+
+  @doc """
+  Configure click / double-click / tap detection by writing `CLICK_CFG`,
+  `CLICK_THS`, `TIME_LIMIT`, `TIME_LATENCY`, and `TIME_WINDOW`.
+
+  ## Options
+
+    * `:events` — list of `t:LIS3DH.Click.click_event/0` to enable
+      (required; pass `[]` to disable all).
+    * `:threshold_mg` — threshold in milli-g (required). Same LSB table as
+      `INT*_THS`.
+    * `:latched` — when `true`, the click interrupt stays high until
+      `CLICK_SRC` is read (default `false`).
+    * `:time_limit` — `0..127` count of `1/ODR` periods, the max click pulse
+      width (required).
+    * `:time_latency` — `0..255` count of `1/ODR` periods, the dead time
+      after a click (required).
+    * `:time_window` — `0..255` count of `1/ODR` periods, the search window
+      for the second click of a double-click (default `0`).
+
+  Requires the accelerometer range to be cached on the struct.
+  """
+  @spec configure_click(t, keyword) :: {:ok, t} | {:error, term}
+  def configure_click(%__MODULE__{range: nil}, _opts), do: {:error, :range_not_set}
+
+  def configure_click(%__MODULE__{range: range} = acc, opts) do
+    events = Keyword.fetch!(opts, :events)
+    threshold_mg = Keyword.fetch!(opts, :threshold_mg)
+    latched = Keyword.get(opts, :latched, false)
+    time_limit = Keyword.fetch!(opts, :time_limit)
+    time_latency = Keyword.fetch!(opts, :time_latency)
+    time_window = Keyword.get(opts, :time_window, 0)
+
+    unless is_integer(time_limit) and time_limit in 0..127,
+      do: raise(ArgumentError, "invalid time_limit: #{inspect(time_limit)} (must be 0..127)")
+
+    unless is_integer(time_latency) and time_latency in 0..255,
+      do: raise(ArgumentError, "invalid time_latency: #{inspect(time_latency)} (must be 0..255)")
+
+    unless is_integer(time_window) and time_window in 0..255,
+      do: raise(ArgumentError, "invalid time_window: #{inspect(time_window)} (must be 0..255)")
+
+    with {:ok, acc} <-
+           Registers.write_click_ths(acc, Click.encode_click_ths!(threshold_mg, range, latched)),
+         {:ok, acc} <- Registers.write_time_limit(acc, <<time_limit>>),
+         {:ok, acc} <- Registers.write_time_latency(acc, <<time_latency>>),
+         {:ok, acc} <- Registers.write_time_window(acc, <<time_window>>) do
+      Registers.write_click_cfg(acc, Click.encode_click_cfg(events))
+    end
+  end
+
+  @doc """
+  Read the `CLICK_SRC` register and decode it. Reading clears the latched
+  flags if `LIR_Click` was set during configure.
+  """
+  @spec read_click_source(t) :: {:ok, Click.source_flags()} | {:error, term}
+  def read_click_source(%__MODULE__{} = acc) do
+    with {:ok, byte} <- Registers.read_click_src(acc) do
+      {:ok, Click.decode_click_src(byte)}
+    end
+  end
+
+  @doc """
+  Configure an inertial interrupt (1 or 2) by writing `INT*_CFG`, `INT*_THS`,
+  and `INT*_DURATION` atomically.
+
+  ## Options
+
+    * `:mode` — `t:LIS3DH.Interrupts.aoi_mode/0` (default `:or`).
+    * `:axes` — list of `t:LIS3DH.Interrupts.axis_event/0` to enable.
+    * `:threshold_mg` — non-negative integer threshold in milli-g. The
+      LSB size depends on the cached `:range`; this function reads the
+      cached value and rounds the threshold to fit.
+    * `:duration` — `0..127` count of `1/ODR` periods the condition must
+      hold before the interrupt fires (default `0`).
+
+  Requires the accelerometer range to be cached on the struct.
+  """
+  @spec configure_inertial_interrupt(t, Interrupts.pin(), keyword) :: {:ok, t} | {:error, term}
+  def configure_inertial_interrupt(%__MODULE__{range: nil}, _pin, _opts),
+    do: {:error, :range_not_set}
+
+  def configure_inertial_interrupt(%__MODULE__{range: range} = acc, pin, opts)
+      when pin in [:int1, :int2] do
+    cfg = Interrupts.encode_int_cfg(opts)
+    ths = Interrupts.encode_threshold!(Keyword.get(opts, :threshold_mg, 0), range)
+    dur = Interrupts.encode_duration!(Keyword.get(opts, :duration, 0))
+
+    {cfg_w, ths_w, dur_w} =
+      case pin do
+        :int1 ->
+          {&Registers.write_int1_cfg/2, &Registers.write_int1_ths/2,
+           &Registers.write_int1_duration/2}
+
+        :int2 ->
+          {&Registers.write_int2_cfg/2, &Registers.write_int2_ths/2,
+           &Registers.write_int2_duration/2}
+      end
+
+    with {:ok, acc} <- ths_w.(acc, ths),
+         {:ok, acc} <- dur_w.(acc, dur) do
+      cfg_w.(acc, cfg)
+    end
+  end
+
+  @doc """
+  Read the `INT*_SRC` register. Reading clears the latched flags if latching
+  is enabled (`LIR_INTx` in `CTRL_REG5`).
+  """
+  @spec read_interrupt_source(t, Interrupts.pin()) ::
+          {:ok, Interrupts.source_flags()} | {:error, term}
+  def read_interrupt_source(%__MODULE__{} = acc, pin) when pin in [:int1, :int2] do
+    reader = if pin == :int1, do: &Registers.read_int1_src/1, else: &Registers.read_int2_src/1
+
+    with {:ok, byte} <- reader.(acc) do
+      {:ok, Interrupts.decode_int_src(byte)}
+    end
+  end
+
+  @doc """
+  OR-in the given routing bits in `CTRL_REG3` (INT1 routing). Leaves the
+  other bits untouched, so it composes cleanly with `LIS3DH.Sampler` which
+  also writes the FIFO bits in this register.
+
+  Valid `events`: `:click`, `:ia1`, `:ia2`, `:zyxda`, `:adc_drdy_321`,
+  `:fifo_watermark`, `:fifo_overrun`.
+  """
+  @spec enable_int1_routing(t, [int1_event]) :: {:ok, t} | {:error, term}
+        when int1_event:
+               :click | :ia1 | :ia2 | :zyxda | :adc_drdy_321 | :fifo_watermark | :fifo_overrun
+  def enable_int1_routing(%__MODULE__{} = acc, events) when is_list(events) do
+    mask = int1_routing_mask(events)
+    Registers.update_ctrl_reg_3(acc, fn <<byte>> -> <<byte ||| mask>> end)
+  end
+
+  @doc "Mask out the given routing bits in `CTRL_REG3` (INT1 routing)."
+  @spec disable_int1_routing(t, [int1_event]) :: {:ok, t} | {:error, term}
+        when int1_event:
+               :click | :ia1 | :ia2 | :zyxda | :adc_drdy_321 | :fifo_watermark | :fifo_overrun
+  def disable_int1_routing(%__MODULE__{} = acc, events) when is_list(events) do
+    mask = int1_routing_mask(events)
+    Registers.update_ctrl_reg_3(acc, fn <<byte>> -> <<byte &&& bnot(mask) &&& 0xFF>> end)
+  end
+
+  @doc """
+  OR-in the given routing bits in `CTRL_REG6` (INT2 routing). Preserves the
+  `INT_POLARITY` bit and any others not in `events`.
+
+  Valid `events`: `:click`, `:ia1`, `:ia2`, `:boot`, `:activity`.
+  """
+  @spec enable_int2_routing(t, [int2_event]) :: {:ok, t} | {:error, term}
+        when int2_event: :click | :ia1 | :ia2 | :boot | :activity
+  def enable_int2_routing(%__MODULE__{} = acc, events) when is_list(events) do
+    mask = int2_routing_mask(events)
+    Registers.update_ctrl_reg_6(acc, fn <<byte>> -> <<byte ||| mask>> end)
+  end
+
+  @doc "Mask out the given routing bits in `CTRL_REG6` (INT2 routing)."
+  @spec disable_int2_routing(t, [int2_event]) :: {:ok, t} | {:error, term}
+        when int2_event: :click | :ia1 | :ia2 | :boot | :activity
+  def disable_int2_routing(%__MODULE__{} = acc, events) when is_list(events) do
+    mask = int2_routing_mask(events)
+    Registers.update_ctrl_reg_6(acc, fn <<byte>> -> <<byte &&& bnot(mask) &&& 0xFF>> end)
+  end
+
+  @doc """
+  Set the active level for both INT pins via `CTRL_REG6.INT_POLARITY`.
+
+  `polarity` is `:active_high` (default after reset) or `:active_low`.
+  """
+  @spec set_interrupt_polarity(t, :active_high | :active_low) :: {:ok, t} | {:error, term}
+  def set_interrupt_polarity(%__MODULE__{} = acc, polarity)
+      when polarity in [:active_high, :active_low] do
+    bit = if polarity == :active_low, do: 1 <<< 1, else: 0
+
+    Registers.update_ctrl_reg_6(acc, fn <<byte>> ->
+      <<(byte &&& bnot(1 <<< 1) &&& 0xFF) ||| bit>>
+    end)
+  end
+
+  @doc """
+  Toggle interrupt latching for the given pin via `CTRL_REG5.LIR_INT1` /
+  `LIR_INT2`. When latched, the interrupt pin stays asserted until the
+  corresponding `INT*_SRC` register is read.
+  """
+  @spec set_interrupt_latching(t, Interrupts.pin(), boolean) :: {:ok, t} | {:error, term}
+  def set_interrupt_latching(%__MODULE__{} = acc, pin, latched?) when pin in [:int1, :int2] do
+    bit = if pin == :int1, do: 3, else: 1
+    update_bit(acc, &Registers.update_ctrl_reg_5/2, bit, latched?)
+  end
+
+  @doc """
+  Toggle 4D detection for the given pin via `CTRL_REG5.D4D_INT1` /
+  `D4D_INT2`. 4D restricts 6D detection to the X/Y plane (Z position
+  ignored). Has no effect unless `INT*_CFG.6D` is also set.
+  """
+  @spec set_4d_detection(t, Interrupts.pin(), boolean) :: {:ok, t} | {:error, term}
+  def set_4d_detection(%__MODULE__{} = acc, pin, enabled?) when pin in [:int1, :int2] do
+    bit = if pin == :int1, do: 2, else: 0
+    update_bit(acc, &Registers.update_ctrl_reg_5/2, bit, enabled?)
+  end
+
+  defp int1_routing_mask(events) do
+    map = %{
+      click: 1 <<< 7,
+      ia1: 1 <<< 6,
+      ia2: 1 <<< 5,
+      zyxda: 1 <<< 4,
+      adc_drdy_321: 1 <<< 3,
+      fifo_watermark: 1 <<< 2,
+      fifo_overrun: 1 <<< 1
+    }
+
+    Enum.reduce(events, 0, fn event, acc ->
+      acc ||| Map.fetch!(map, event)
+    end)
+  end
+
+  defp int2_routing_mask(events) do
+    map = %{
+      click: 1 <<< 7,
+      ia1: 1 <<< 6,
+      ia2: 1 <<< 5,
+      boot: 1 <<< 4,
+      activity: 1 <<< 3
+    }
+
+    Enum.reduce(events, 0, fn event, acc ->
+      acc ||| Map.fetch!(map, event)
+    end)
+  end
+
+  defp update_bit(acc, updater, bit, true),
+    do: updater.(acc, fn <<byte>> -> <<byte ||| 1 <<< bit>> end)
+
+  defp update_bit(acc, updater, bit, false),
+    do: updater.(acc, fn <<byte>> -> <<byte &&& bnot(1 <<< bit) &&& 0xFF>> end)
+
+  @doc """
   Set the `CTRL_REG4.ST` self-test field while preserving the other bits.
 
   The recommended self-test procedure (per ST application note AN3308) is:
@@ -381,7 +757,7 @@ defmodule LIS3DH do
     st_code = Config.self_test_code(mode)
 
     Registers.update_ctrl_reg_4(acc, fn <<byte>> ->
-      <<byte &&& bnot(0b110) &&& 0xFF ||| st_code <<< 1>>
+      <<(byte &&& bnot(0b110) &&& 0xFF) ||| st_code <<< 1>>
     end)
   end
 
