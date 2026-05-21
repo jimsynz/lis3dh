@@ -184,6 +184,203 @@ defmodule LIS3DHTest do
     end
   end
 
+  describe "auxiliary ADC enable/disable" do
+    test "enable_auxiliary_adc sets bit 7 of TEMP_CFG_REG" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x9F>>, 1, _opts -> {:ok, <<0x00>>, fake} end)
+      |> expect(:write, fn ^fake, <<0x9F, 0x80>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.enable_auxiliary_adc(acc)
+    end
+
+    test "disable_auxiliary_adc clears bit 7 of TEMP_CFG_REG" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x9F>>, 1, _opts -> {:ok, <<0xC0>>, fake} end)
+      |> expect(:write, fn ^fake, <<0x9F, 0x40>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.disable_auxiliary_adc(acc)
+    end
+
+    test "enable_temperature_sensor sets both ADC_EN and TEMP_EN" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x9F>>, 1, _opts -> {:ok, <<0x00>>, fake} end)
+      |> expect(:write, fn ^fake, <<0x9F, 0xC0>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.enable_temperature_sensor(acc)
+    end
+
+    test "disable_temperature_sensor clears TEMP_EN only" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x9F>>, 1, _opts -> {:ok, <<0xC0>>, fake} end)
+      |> expect(:write, fn ^fake, <<0x9F, 0x80>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.disable_temperature_sensor(acc)
+    end
+  end
+
+  describe "read_auxiliary_adc/2" do
+    test "errors without a cached operating_mode" do
+      {:ok, fake} = Fake.acquire([])
+      assert {:error, :operating_mode_not_set} =
+               LIS3DH.read_auxiliary_adc(%LIS3DH{conn: fake}, 1)
+    end
+
+    test "reads channel 1 at 10-bit (normal mode) and centres at 1200 mV" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      # raw = 0 → 1200 mV (centre)
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x88>>, 2, _opts -> {:ok, <<0x00, 0x00>>, fake} end)
+
+      assert {:ok, 1200.0} = LIS3DH.read_auxiliary_adc(acc, 1)
+    end
+
+    test "reads channel 2 at the bottom of the range" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      # -512 in 10-bit signed = -400 mV → 1200 - 400 = 800 mV.
+      # Left-justified by 6: -512 << 6 = -32768 → 0x8000 (two's complement, LE bytes 0x00 0x80)
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x8A>>, 2, _opts -> {:ok, <<0x00, 0x80>>, fake} end)
+
+      assert {:ok, 800.0} = LIS3DH.read_auxiliary_adc(acc, 2)
+    end
+
+    test "reads channel 3 in low-power mode (8-bit aux ADC)" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :low_power, range: 2}
+
+      # raw = -128 in 8-bit signed = -400 mV → 800 mV.
+      # Left-justified by 8: -128 << 8 = -32768 → 0x8000 (LE 0x00 0x80)
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x00, 0x80>>, fake} end)
+
+      assert {:ok, 800.0} = LIS3DH.read_auxiliary_adc(acc, 3)
+    end
+  end
+
+  describe "read_temperature/1" do
+    test "errors without a cached operating_mode" do
+      {:ok, fake} = Fake.acquire([])
+      assert {:error, :operating_mode_not_set} = LIS3DH.read_temperature(%LIS3DH{conn: fake})
+    end
+
+    test "returns 1 digit/°C delta in normal mode (10-bit aux ADC)" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      # raw = 5 (at 10-bit) → 5 °C delta. Left-justified by 6: 5 << 6 = 320 = 0x0140 → LE 0x40 0x01
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x40, 0x01>>, fake} end)
+
+      assert {:ok, 5.0} = LIS3DH.read_temperature(acc)
+    end
+
+    test "handles negative deltas" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
+
+      # raw = -10 (at 10-bit). -10 << 6 = -640. In 16-bit two's complement = 65536-640=64896=0xFD80
+      # LE: 0x80 0xFD
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x80, 0xFD>>, fake} end)
+
+      assert {:ok, -10.0} = LIS3DH.read_temperature(acc)
+    end
+  end
+
+  describe "set_self_test/2" do
+    test "sets ST field to 01 while preserving the other CTRL_REG4 bits" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      # current CTRL_REG4: BDU=1 + HR=1 = 0x88
+      |> expect(:write_read, fn ^fake, <<0xA3>>, 1, _opts -> {:ok, <<0x88>>, fake} end)
+      # new CTRL_REG4: same bits + ST=01 (bit 1) = 0x8A
+      |> expect(:write, fn ^fake, <<0xA3, 0x8A>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.set_self_test(acc, :self_test_0)
+    end
+
+    test "clears ST field to 00" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA3>>, 1, _opts -> {:ok, <<0x8A>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA3, 0x88>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.set_self_test(acc, :off)
+    end
+
+    test "sets ST field to 10" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA3>>, 1, _opts -> {:ok, <<0x88>>, fake} end)
+      |> expect(:write, fn ^fake, <<0xA3, 0x8C>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.set_self_test(acc, :self_test_1)
+    end
+  end
+
+  describe "configure_high_pass_filter/2" do
+    test "writes CTRL_REG2" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write, fn ^fake, <<0xA1, 0x8F>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} =
+               LIS3DH.configure_high_pass_filter(acc,
+                 mode: :normal,
+                 filtered_data_output: true,
+                 enable_for_click: true,
+                 enable_for_interrupt_1: true,
+                 enable_for_interrupt_2: true
+               )
+    end
+  end
+
+  describe "REFERENCE register helpers" do
+    test "read_reference returns a signed byte" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0xA6>>, 1, _opts -> {:ok, <<0xFF>>, fake} end)
+
+      assert {:ok, -1} = LIS3DH.read_reference(acc)
+    end
+
+    test "write_reference writes a signed byte" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake}
+
+      I2C
+      |> expect(:write, fn ^fake, <<0xA6, 0xFE>>, _opts -> {:ok, fake} end)
+
+      assert {:ok, %LIS3DH{}} = LIS3DH.write_reference(acc, -2)
+    end
+  end
+
   describe "power_on/2 and power_off/1" do
     test "power_on sets the ODR field while preserving the LPen and axis bits" do
       {:ok, fake} = Fake.acquire([])

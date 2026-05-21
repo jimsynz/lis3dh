@@ -100,4 +100,63 @@ defmodule LIS3DH.ConfigTest do
       assert Config.native_width(:high_resolution) == 12
     end
   end
+
+  describe "aux_adc_width/1" do
+    test "is 8 for low-power and 10 for normal / high-resolution" do
+      assert Config.aux_adc_width(:low_power) == 8
+      assert Config.aux_adc_width(:normal) == 10
+      assert Config.aux_adc_width(:high_resolution) == 10
+    end
+  end
+
+  describe "encode_ctrl_reg_2/1" do
+    test "defaults to all-zero (HPF bypassed, mode 0)" do
+      assert <<0x00>> = Config.encode_ctrl_reg_2()
+    end
+
+    test "encodes filter mode and cutoff into the top nibble" do
+      # mode=:autoreset (0b11), cutoff=2 → 0b1110_0000 = 0xE0
+      assert <<0xE0>> = Config.encode_ctrl_reg_2(mode: :autoreset, cutoff: 2)
+    end
+
+    test "encodes all enable bits" do
+      # mode=:normal (0b10), cutoff=0, FDS=1 (bit 3), HPCLICK=1 (bit 2),
+      # HP_IA2=1 (bit 1), HP_IA1=1 (bit 0) → 0b1000_1111 = 0x8F
+      assert <<0x8F>> =
+               Config.encode_ctrl_reg_2(
+                 mode: :normal,
+                 filtered_data_output: true,
+                 enable_for_click: true,
+                 enable_for_interrupt_1: true,
+                 enable_for_interrupt_2: true
+               )
+    end
+
+    test "rejects out-of-range cutoff" do
+      assert_raise ArgumentError, ~r/invalid cutoff/, fn ->
+        Config.encode_ctrl_reg_2(cutoff: 4)
+      end
+    end
+  end
+
+  describe "decode_ctrl_reg_2/1 round-trips encode_ctrl_reg_2/1" do
+    test "for every supported field combination" do
+      for mode <- [:normal_with_reset, :reference, :normal, :autoreset],
+          cutoff <- 0..3,
+          fds <- [false, true],
+          click <- [false, true] do
+        opts = [
+          mode: mode,
+          cutoff: cutoff,
+          filtered_data_output: fds,
+          enable_for_click: click,
+          enable_for_interrupt_1: false,
+          enable_for_interrupt_2: false
+        ]
+
+        decoded = opts |> Config.encode_ctrl_reg_2() |> Config.decode_ctrl_reg_2()
+        assert decoded == Map.new(opts)
+      end
+    end
+  end
 end

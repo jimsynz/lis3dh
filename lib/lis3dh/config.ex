@@ -63,6 +63,24 @@ defmodule LIS3DH.Config do
   @typedoc "Block-data-update mode for `CTRL_REG4.BDU`."
   @type bdu :: :continuous | :hold
 
+  @typedoc """
+  High-pass filter mode for `CTRL_REG2.HPM`.
+
+    * `:normal_with_reset` — continuous HPF; the internal state can be reset
+      by reading the `REFERENCE` register.
+    * `:reference` — HPF uses the `REFERENCE` register as the filtered
+      reference signal.
+    * `:normal` — continuous HPF with no reset hook.
+    * `:autoreset` — HPF auto-resets on every interrupt event.
+  """
+  @type hpf_mode :: :normal_with_reset | :reference | :normal | :autoreset
+
+  @typedoc "High-pass filter cutoff selector. The actual −3 dB cutoff depends on ODR; lower codes give higher cutoffs."
+  @type hpf_cutoff :: 0..3
+
+  @typedoc "Self-test mode selection for `CTRL_REG4.ST`."
+  @type self_test_mode :: :off | :self_test_0 | :self_test_1
+
   @odr_codes %{
     :power_down => 0b0000,
     1 => 0b0001,
@@ -79,6 +97,8 @@ defmodule LIS3DH.Config do
 
   @range_codes %{2 => 0b00, 4 => 0b01, 8 => 0b10, 16 => 0b11}
   @bdu_codes %{continuous: 0, hold: 1}
+  @hpf_mode_codes %{normal_with_reset: 0b00, reference: 0b01, normal: 0b10, autoreset: 0b11}
+  @self_test_codes %{off: 0b00, self_test_0: 0b01, self_test_1: 0b10}
 
   # mg/LSB at the native bit width per (operating_mode, range).
   # Source: ST AN3308 application note / datasheet table 10 extended for all
@@ -107,6 +127,7 @@ defmodule LIS3DH.Config do
                end)
   @range_decodes Map.new(@range_codes, fn {k, v} -> {v, k} end)
   @bdu_decodes Map.new(@bdu_codes, fn {k, v} -> {v, k} end)
+  @hpf_mode_decodes Map.new(@hpf_mode_codes, fn {k, v} -> {v, k} end)
 
   @doc """
   Encode a `CTRL_REG1` byte from keyword options.
@@ -171,6 +192,62 @@ defmodule LIS3DH.Config do
     }
   end
 
+  @doc """
+  Encode a `CTRL_REG2` byte (high-pass filter configuration) from keyword
+  options.
+
+  ## Options
+
+    * `:mode` — `t:hpf_mode/0` (default `:normal_with_reset`).
+    * `:cutoff` — `t:hpf_cutoff/0` (default `0`). The actual −3 dB cutoff
+      depends on ODR per the datasheet figures.
+    * `:filtered_data_output` (default `false`) — when `true`, the HPF output
+      replaces the unfiltered data in `OUT_*` and the FIFO. When `false`
+      (`FDS=0`) the HPF only affects the click / interrupt detectors.
+    * `:enable_for_click` (default `false`) — apply HPF to the click
+      detector.
+    * `:enable_for_interrupt_1` (default `false`) — apply HPF to inertial
+      interrupt 1 (AOI 1).
+    * `:enable_for_interrupt_2` (default `false`) — apply HPF to inertial
+      interrupt 2 (AOI 2).
+  """
+  @spec encode_ctrl_reg_2(keyword) :: <<_::8>>
+  def encode_ctrl_reg_2(opts \\ []) when is_list(opts) do
+    mode = lookup!(@hpf_mode_codes, Keyword.get(opts, :mode, :normal_with_reset), :mode)
+    cutoff = Keyword.get(opts, :cutoff, 0)
+
+    unless is_integer(cutoff) and cutoff in 0..3 do
+      raise ArgumentError, "invalid cutoff: #{inspect(cutoff)} (valid values: 0..3)"
+    end
+
+    fds = if Keyword.get(opts, :filtered_data_output, false), do: 1, else: 0
+    hpclick = if Keyword.get(opts, :enable_for_click, false), do: 1, else: 0
+    hp_ia2 = if Keyword.get(opts, :enable_for_interrupt_2, false), do: 1, else: 0
+    hp_ia1 = if Keyword.get(opts, :enable_for_interrupt_1, false), do: 1, else: 0
+
+    <<mode <<< 6 ||| cutoff <<< 4 ||| fds <<< 3 ||| hpclick <<< 2 ||| hp_ia2 <<< 1 ||| hp_ia1>>
+  end
+
+  @doc "Decode a `CTRL_REG2` byte into a map of its fields."
+  @spec decode_ctrl_reg_2(<<_::8>>) :: %{
+          mode: hpf_mode,
+          cutoff: hpf_cutoff,
+          filtered_data_output: boolean,
+          enable_for_click: boolean,
+          enable_for_interrupt_1: boolean,
+          enable_for_interrupt_2: boolean
+        }
+  def decode_ctrl_reg_2(<<byte>>) do
+    %{
+      mode: lookup!(@hpf_mode_decodes, byte >>> 6 &&& 0b11, :hpf_mode_code),
+      cutoff: byte >>> 4 &&& 0b11,
+      filtered_data_output: (byte >>> 3 &&& 1) == 1,
+      enable_for_click: (byte >>> 2 &&& 1) == 1,
+      enable_for_interrupt_2: (byte >>> 1 &&& 1) == 1,
+      enable_for_interrupt_1: (byte &&& 1) == 1
+    }
+  end
+
   @doc "Decode a `CTRL_REG4` byte into a map of its fields."
   @spec decode_ctrl_reg_4(<<_::8>>) :: %{hr: boolean, range: range, block_data_update: bdu}
   def decode_ctrl_reg_4(<<byte>>) do
@@ -198,6 +275,12 @@ defmodule LIS3DH.Config do
   end
 
   @doc """
+  Encode a self-test mode atom to its 2-bit `CTRL_REG4.ST` code.
+  """
+  @spec self_test_code(self_test_mode) :: 0..2
+  def self_test_code(mode), do: lookup!(@self_test_codes, mode, :self_test_mode)
+
+  @doc """
   Returns the per-LSB sensitivity in milli-g at the native bit width for the
   given operating mode and range.
   """
@@ -205,12 +288,23 @@ defmodule LIS3DH.Config do
   def sensitivity(mode, range), do: Map.fetch!(@sensitivities, {mode, range})
 
   @doc """
-  Returns the native ADC bit width for the given operating mode — equivalent
-  to the right-shift required to recover the N-bit signed value from the
-  16-bit left-justified `OUT_*` registers.
+  Returns the native accelerometer ADC bit width for the given operating
+  mode — equivalent to the right-shift required to recover the N-bit signed
+  value from the 16-bit left-justified `OUT_*` registers.
   """
   @spec native_width(operating_mode) :: 8 | 10 | 12
   def native_width(mode), do: Map.fetch!(@native_widths, mode)
+
+  @doc """
+  Returns the bit width of the auxiliary ADC for the given operating mode.
+
+  Per datasheet §3.7, the auxiliary ADC is 8-bit when `LPen=1` (low-power)
+  and 10-bit otherwise — including in high-resolution mode, even though the
+  accelerometer itself is 12-bit there.
+  """
+  @spec aux_adc_width(operating_mode) :: 8 | 10
+  def aux_adc_width(:low_power), do: 8
+  def aux_adc_width(_mode), do: 10
 
   defp decode_axes(byte) do
     Enum.filter([:x, :y, :z], fn axis ->
