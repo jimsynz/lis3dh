@@ -30,7 +30,8 @@ defmodule LIS3DH.MixProject do
       maintainers: ["James Harton <james@harton.dev>"],
       licenses: ["Apache-2.0"],
       links: %{
-        "Source" => "https://harton.dev/james/lis3dh"
+        "Source" => "https://harton.dev/james/lis3dh",
+        "GitHub" => "https://github.com/jimsynz/lis3dh"
       }
     ]
   end
