@@ -1,6 +1,23 @@
-# Changelog
+# Change Log
 
 All notable changes to this project will be documented in this file.
+See [Conventional Commits](Https://conventionalcommits.org) for commit guidelines.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+<!-- changelog -->
+
+## v0.1.0 (2026-05-25)
+
+
+
+
+### Features:
+
+* FIFO sampler, interrupt framework, motion / orientation / click / activity by James Harton
+
+* auxiliary ADC, temperature sensor, HPF config, self-test by James Harton
+
+* wafer transport, registers, acquire, and configurable accelerometer reads by James Harton
+
+### Bug Fixes:
+
+* `read_temperature/1` decodes 8-bit `OUT_ADC3_H`, not the full aux ADC width by Renovate Bot
