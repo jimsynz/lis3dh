@@ -275,18 +275,13 @@ defmodule LIS3DHTest do
   end
 
   describe "read_temperature/1" do
-    test "errors without a cached operating_mode" do
-      {:ok, fake} = Fake.acquire([])
-      assert {:error, :operating_mode_not_set} = LIS3DH.read_temperature(%LIS3DH{conn: fake})
-    end
-
-    test "returns 1 digit/°C delta in normal mode (10-bit aux ADC)" do
+    test "returns the signed high byte as a 1 LSB/°C delta" do
       {:ok, fake} = Fake.acquire([])
       acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
 
-      # raw = 5 (at 10-bit) → 5 °C delta. Left-justified by 6: 5 << 6 = 320 = 0x0140 → LE 0x40 0x01
+      # Only OUT_ADC3_H is meaningful: 0x05 → +5 °C. Low byte is junk and must be ignored.
       I2C
-      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x40, 0x01>>, fake} end)
+      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0xAA, 0x05>>, fake} end)
 
       assert {:ok, 5.0} = LIS3DH.read_temperature(acc)
     end
@@ -295,12 +290,21 @@ defmodule LIS3DHTest do
       {:ok, fake} = Fake.acquire([])
       acc = %LIS3DH{conn: fake, operating_mode: :normal, range: 2}
 
-      # raw = -10 (at 10-bit). -10 << 6 = -640. In 16-bit two's complement = 65536-640=64896=0xFD80
-      # LE: 0x80 0xFD
+      # High byte 0xF6 = -10 signed.
       I2C
-      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x80, 0xFD>>, fake} end)
+      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0xAA, 0xF6>>, fake} end)
 
       assert {:ok, -10.0} = LIS3DH.read_temperature(acc)
+    end
+
+    test "resolution is independent of operating mode" do
+      {:ok, fake} = Fake.acquire([])
+      acc = %LIS3DH{conn: fake, operating_mode: :low_power, range: 2}
+
+      I2C
+      |> expect(:write_read, fn ^fake, <<0x8C>>, 2, _opts -> {:ok, <<0x00, 0x0B>>, fake} end)
+
+      assert {:ok, 11.0} = LIS3DH.read_temperature(acc)
     end
   end
 

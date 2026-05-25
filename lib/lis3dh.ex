@@ -278,24 +278,21 @@ defmodule LIS3DH do
 
   @doc """
   Read the embedded temperature sensor on auxiliary ADC channel 3 and return
-  the **delta** temperature in °C.
+  the **delta** temperature in °C, relative to the 25 °C factory
+  calibration point (i.e. add `25.0` for the absolute reading).
 
-  The LIS3DH's temperature sensor outputs `1 digit/°C` relative to an
-  unspecified factory reference (often approximated as ambient at
-  calibration time). Add your own reference offset (commonly `25.0`) for an
-  absolute reading.
+  Only the `OUT_ADC3_H` byte carries temperature data — sensitivity is
+  `1 LSB/°C` and resolution is 8-bit regardless of operating mode
+  (datasheet §3.2). The full 16-bit word is still read so `BDU=:hold`
+  unlatches cleanly.
 
   Requires the temperature sensor to be enabled via
-  `enable_temperature_sensor/1` and `:operating_mode` to be cached.
+  `enable_temperature_sensor/1`.
   """
   @spec read_temperature(t) :: {:ok, float} | {:error, term}
-  def read_temperature(%__MODULE__{operating_mode: nil}),
-    do: {:error, :operating_mode_not_set}
-
-  def read_temperature(%__MODULE__{operating_mode: mode} = acc) do
+  def read_temperature(%__MODULE__{} = acc) do
     with {:ok, <<raw::little-signed-16>>} <- Chip.read_register(acc, @out_adc1_l + 4, 2) do
-      shift = 16 - Config.aux_adc_width(mode)
-      {:ok, (raw >>> shift) * 1.0}
+      {:ok, (raw >>> 8) * 1.0}
     end
   end
 
