@@ -48,7 +48,7 @@ defmodule LIS3DH.MixProject do
       {:ex_check, "~> 0.16", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},
       {:git_ops, "~> 2.0", only: [:dev], runtime: false},
-      {:igniter, "~> 0.6", only: [:dev, :test]},
+      {:igniter, "~> 0.8", only: [:dev, :test]},
       {:mimic, "~> 2.0", only: [:dev, :test]},
       {:mix_audit, "~> 2.0", only: [:dev, :test], runtime: false}
     ]
