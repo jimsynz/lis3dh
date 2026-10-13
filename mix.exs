@@ -45,7 +45,7 @@ defmodule LIS3DH.MixProject do
       {:credo, "~> 1.0", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false},
       {:doctor, "~> 0.23", only: [:dev, :test], runtime: false},
-      {:ex_check, "~> 0.16", only: [:dev, :test], runtime: false},
+      {:ex_check, "~> 0.17", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.40", only: [:dev, :test], runtime: false},
       {:git_ops, "~> 2.0", only: [:dev], runtime: false},
       {:igniter, "~> 0.8", only: [:dev, :test]},
